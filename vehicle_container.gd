@@ -99,6 +99,18 @@ func _create_interior_layout() -> void:
 		_:
 			interior_layout = InteriorLayout.create_single_room(size_scale)
 
+## Returns the Z half-extent of the entrance room (grid 0,0,0).
+## Used by game_manager for entry/exit zone calculations.
+## Different layout types have different room depths — corridor uses 8*scale, others use 10*scale.
+func get_entrance_half_z() -> float:
+	if not interior_layout or interior_layout.rooms.is_empty():
+		return 5.0 * 3.0 * size_multiplier  # safe fallback
+	for room in interior_layout.rooms:
+		if room.grid_position == Vector3i.ZERO:
+			return room.get_half_extents().z
+	return interior_layout.rooms[0].get_half_extents().z
+
+
 func _create_container_physics_space() -> void:
 	# Each container has its own interior physics space for recursive nesting
 	container_interior_space = PhysicsServer3D.space_create()

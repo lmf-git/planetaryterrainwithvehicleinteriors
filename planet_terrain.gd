@@ -14,6 +14,7 @@ const TILE_WORLD_SIZE: float = TILE_GRID * VERT_SPACING   # 64 world units
 
 const MAX_HEIGHT     : float = 450.0   # Dramatic NMS-style elevation range
 const PLANET_RADIUS  : float = 12000.0 # Large planet — subtle curvature, wide horizon
+const WATER_LEVEL    : float = -5.0    # Sea surface: 5 units below sphere_y (PLANET_RADIUS + WATER_LEVEL)
 
 # ── LOD ───────────────────────────────────────────────────────────────────────
 const LOD_STEPS  : Array = [1,    2,     4,     8    ]   # Vertex stride per LOD
@@ -96,48 +97,52 @@ func _ready() -> void:
 	_setup_noise()
 	_setup_material()
 	_setup_map_camera()
+	_create_water_sphere()
 
 
 func _setup_noise() -> void:
-	# All noises use frequency=1.0 — feature scale is controlled entirely via
-	# the coordinate arguments in _sample_height (avoids compounded frequency confusion)
+	# All noises: frequency=1.0 — feature scale controlled entirely by coord scaling
 
-	# Domain warp: large-scale coordinate displacement for organic flow
+	# Domain warp: used at two scales to create organic continental shapes
 	noise_warp = FastNoiseLite.new()
 	noise_warp.noise_type         = FastNoiseLite.TYPE_PERLIN
 	noise_warp.seed               = 7
 	noise_warp.frequency          = 1.0
 	noise_warp.fractal_type       = FastNoiseLite.FRACTAL_FBM
-	noise_warp.fractal_octaves    = 3
+	noise_warp.fractal_octaves    = 4
+	noise_warp.fractal_lacunarity = 2.0
+	noise_warp.fractal_gain       = 0.5
 
-	# Continent noise: very large scale — determines plains vs mountain biomes
+	# Continent: large-scale biome distribution — ocean / coast / plains / mountains
 	noise_base = FastNoiseLite.new()
 	noise_base.noise_type         = FastNoiseLite.TYPE_PERLIN
 	noise_base.seed               = 42
 	noise_base.frequency          = 1.0
 	noise_base.fractal_type       = FastNoiseLite.FRACTAL_FBM
-	noise_base.fractal_octaves    = 4
+	noise_base.fractal_octaves    = 6
 	noise_base.fractal_lacunarity = 2.0
 	noise_base.fractal_gain       = 0.5
 
-	# Ridge noise: mountain shapes — sharp spires and knife-edge peaks
+	# Ridge: knife-edge mountains using RIDGED fractal (output [0,1], peaks=1)
 	noise_ridge = FastNoiseLite.new()
-	noise_ridge.noise_type         = FastNoiseLite.TYPE_PERLIN
-	noise_ridge.seed               = 13
-	noise_ridge.frequency          = 1.0
-	noise_ridge.fractal_type       = FastNoiseLite.FRACTAL_FBM
-	noise_ridge.fractal_octaves    = 5
-	noise_ridge.fractal_lacunarity = 2.1
-	noise_ridge.fractal_gain       = 0.50
+	noise_ridge.noise_type                = FastNoiseLite.TYPE_PERLIN
+	noise_ridge.seed                      = 13
+	noise_ridge.frequency                 = 1.0
+	noise_ridge.fractal_type              = FastNoiseLite.FRACTAL_RIDGED
+	noise_ridge.fractal_octaves           = 6
+	noise_ridge.fractal_lacunarity        = 2.1
+	noise_ridge.fractal_gain              = 0.5
+	noise_ridge.fractal_weighted_strength = 0.7  # Pronounced inter-octave ridging
 
-	# Surface detail: player-scale rocks and bumps
+	# Detail: player-scale surface rocks, erosion bumps, grit
 	noise_detail = FastNoiseLite.new()
 	noise_detail.noise_type         = FastNoiseLite.TYPE_PERLIN
 	noise_detail.seed               = 99
 	noise_detail.frequency          = 1.0
 	noise_detail.fractal_type       = FastNoiseLite.FRACTAL_FBM
-	noise_detail.fractal_octaves    = 4
-	noise_detail.fractal_gain       = 0.5
+	noise_detail.fractal_octaves    = 5
+	noise_detail.fractal_lacunarity = 2.0
+	noise_detail.fractal_gain       = 0.55
 
 
 func _setup_material() -> void:
@@ -351,59 +356,69 @@ func _gen_heights(t: HeightmapTile) -> void:
 
 
 func _sample_height(wx: float, wz: float) -> float:
-	# ── Spherical base — terrain drops away toward the horizon like a real planet
+	# ── Spherical base ─────────────────────────────────────────────────────────
 	var r2 := wx * wx + wz * wz
-	var sphere_y : float
 	if r2 >= PLANET_RADIUS * PLANET_RADIUS:
 		return -PLANET_RADIUS
-	sphere_y = sqrt(PLANET_RADIUS * PLANET_RADIUS - r2) - PLANET_RADIUS
+	var sphere_y : float = sqrt(PLANET_RADIUS * PLANET_RADIUS - r2) - PLANET_RADIUS
 
-	# ── Domain warp — large-scale displacement for organic, flowing shapes
-	# Warp features at ~2000 unit scale  (0.0005 = 1/2000)
-	const S_WARP := 0.0005
-	var wx2 := wx + 130.0 * noise_warp.get_noise_2d(wx * S_WARP,        wz * S_WARP)
-	var wz2 := wz + 130.0 * noise_warp.get_noise_2d(wx * S_WARP + 31.7, wz * S_WARP + 17.3)
+	# ── Domain warp: two scales ────────────────────────────────────────────────
+	# Macro warp ~3000u — organic continental masses and ocean basin shapes
+	const S_W1 := 0.00033
+	var wx1 := wx + 250.0 * noise_warp.get_noise_2d(wx  * S_W1,        wz  * S_W1)
+	var wz1 := wz + 250.0 * noise_warp.get_noise_2d(wx  * S_W1 + 31.7, wz  * S_W1 + 17.3)
+	# Mid warp ~500u — local distortion of ridges and coastlines
+	const S_W2 := 0.00200
+	var wx2 := wx1 + 50.0 * noise_warp.get_noise_2d(wx1 * S_W2 + 100.0, wz1 * S_W2 + 200.0)
+	var wz2 := wz1 + 50.0 * noise_warp.get_noise_2d(wx1 * S_W2 + 300.0, wz1 * S_W2 + 400.0)
 
-	# ── Continent noise — very large scale, defines mountain biomes vs flat plains
-	# Features at ~3000 units  (0.00033 ≈ 1/3000)
-	var continent := noise_base.get_noise_2d(wx2 * 0.00033, wz2 * 0.00033)
-	continent = (continent + 1.0) * 0.5   # remap [−1,1] → [0,1]
+	# ── Continent / biome map at ~3000u ────────────────────────────────────────
+	# [-1, 1]: negative = ocean basin, zero = coastline, positive = land / mountains
+	var continent := noise_base.get_noise_2d(wx1 * 0.00033, wz1 * 0.00033)
 
-	# ── Medium undulation — gentle rolling across plains (~700 unit features)
-	var mid := noise_base.get_noise_2d(wx2 * 0.00140 + 444.0, wz2 * 0.00140 + 888.0)
-	mid = (mid + 1.0) * 0.5
+	# ── Rolling plains at ~700u ────────────────────────────────────────────────
+	var plains := noise_base.get_noise_2d(wx2 * 0.00140 + 500.0, wz2 * 0.00140 + 900.0)
+	plains = (plains + 1.0) * 0.5  # [0, 1]
 
-	# ── Ridge peaks — sharp spires at mountain scale (~350 unit features)
-	var r     := noise_ridge.get_noise_2d(wx2 * 0.00280, wz2 * 0.00280)
-	var ridge : float = 1.0 - abs(r)
-	ridge = ridge * ridge * ridge   # cube → very sharp spires
+	# ── Ridged mountains at ~400u (FRACTAL_RIDGED → peaks at 1.0) ─────────────
+	var ridge := noise_ridge.get_noise_2d(wx2 * 0.00250, wz2 * 0.00250)
+	ridge = clamp(ridge, 0.0, 1.0)
+	ridge = sqrt(ridge) * ridge  # broadened base, sharpened tip
 
-	# ── Surface rock detail — player-scale bumps and rocks
-	# ~40 unit features and ~14 unit grit
-	var d1 := noise_detail.get_noise_2d(wx * 0.025, wz * 0.025) * 0.05
-	var d2 := noise_detail.get_noise_2d(wx * 0.072 + 111.1, wz * 0.072 + 222.2) * 0.022
+	# ── Thermal fractures at ~100u (cracks and crevices on mountain faces) ─────
+	var fracture := noise_ridge.get_noise_2d(wx2 * 0.0100 + 700.0, wz2 * 0.0100 + 800.0)
+	fracture = clamp(fracture, 0.0, 1.0) * fracture  # sharpen
 
-	# ── Mountain presence — sharp transition: only high-continent areas get peaks
-	# continent < 0.375 → zero mountains; continent > 0.625 → full mountains
-	var mountain_mask : float = clamp(continent * 4.0 - 1.5, 0.0, 1.0)
-	mountain_mask = mountain_mask * mountain_mask   # square → sharp onset
+	# ── Surface detail: rocks ~30u, grit ~10u ─────────────────────────────────
+	var d1 := noise_detail.get_noise_2d(wx * 0.033, wz * 0.033) * 0.045
+	var d2 := noise_detail.get_noise_2d(wx * 0.100 + 111.1, wz * 0.100 + 222.2) * 0.015
 
-	# ── Spawn-area flat zone ──────────────────────────────────────────────────
-	# Smooth flat circle of radius 250 units centred on origin so ships and
-	# stations have flat ground to land on.  Fades out by radius 400.
+	# ── Biome masks ────────────────────────────────────────────────────────────
+	# ocean_depth: 0 at coast (continent = -0.25), 1 at deep ocean (continent = -1)
+	var ocean_depth   : float = clamp((-continent - 0.25) / 0.75, 0.0, 1.0)
+	# mountain_mask: 0 at plains (continent ≤ 0.35), 1 at high mountains (continent ≥ 0.85)
+	var mountain_mask : float = clamp((continent - 0.35) / 0.50, 0.0, 1.0)
+	mountain_mask = mountain_mask * mountain_mask  # sharp onset
+
+	# ── Height by biome (normalised — multiplied by MAX_HEIGHT at end) ─────────
+	var ocean_h    : float = -(ocean_depth * 0.08 + 0.02)          # [−0.10, −0.02]
+	var plains_h   : float = plains * 0.10 + d1 + d2               # [ 0.00,  0.11]
+	var mountain_h : float = ridge * 0.76 + fracture * 0.10 + d1 * 1.5 + d2
+
+	# ── Blend ocean → land ─────────────────────────────────────────────────────
+	var land_blend : float = clamp((continent + 0.25) / 0.40, 0.0, 1.0)
+	land_blend = land_blend * land_blend
+	var land_h   : float = lerp(plains_h, mountain_h, mountain_mask)
+	var combined : float = lerp(ocean_h, land_h, land_blend)
+
+	# ── Spawn flat zone: flat to 500u, fades out by 700u ──────────────────────
 	var dist_from_origin : float = sqrt(wx * wx + wz * wz)
 	var flat_blend : float = clamp((dist_from_origin - 500.0) / 200.0, 0.0, 1.0)
-	flat_blend = flat_blend * flat_blend   # smooth ease-in curve
-
-	# ── Combine ───────────────────────────────────────────────────────────────
-	# Flat plains: gentle floor + surface grit
-	# Mountain zones: dramatic ridge spires rise sharply above the plains
-	# (overflow past 1.0 gets clamped → flat-topped mesas like NMS)
-	var floor_h : float = mid * 0.08
-	var combined : float = floor_h + mountain_mask * ridge * 0.92 + d1 + d2
-	# Scale terrain down toward zero inside the spawn zone
+	flat_blend = flat_blend * flat_blend
 	combined = combined * flat_blend
-	return sphere_y + clamp(combined, 0.0, 1.0) * MAX_HEIGHT
+
+	# Allow negative (ocean floor below sea level), cap at 1.0 (flat mesa tops)
+	return sphere_y + clamp(combined, -0.12, 1.0) * MAX_HEIGHT
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -502,27 +517,56 @@ func _build_mesh(t: HeightmapTile, lod: int) -> void:
 
 
 func _terrain_color(h: float, normal: Vector3) -> Color:
-	var t     : float = clamp(h / MAX_HEIGHT, 0.0, 1.0)
+	var t     : float = clamp(h / MAX_HEIGHT, -0.15, 1.0)
 	var slope : float = 1.0 - clamp(normal.dot(Vector3.UP), 0.0, 1.0)
 
-	# Warm alien-rock gradient (NMS-inspired)
-	var c0 := Color(0.22, 0.17, 0.12)   # Dark base rock
-	var c1 := Color(0.52, 0.35, 0.18)   # Orange-brown mid
-	var c2 := Color(0.68, 0.54, 0.36)   # Warm rock upper
-	var c3 := Color(0.80, 0.74, 0.62)   # Pale stone peaks
-
+	# Full biome colour ramp: deep ocean floor → coast → plains → peaks
 	var hc : Color
-	if t < 0.25:
-		hc = c0.lerp(c1, t / 0.25)
+	if t < -0.04:
+		hc = Color(0.08, 0.12, 0.22)                                                        # Deep ocean floor
+	elif t < 0.0:
+		hc = Color(0.08, 0.12, 0.22).lerp(Color(0.18, 0.18, 0.16), (t + 0.04) / 0.04)    # Shallow floor
+	elif t < 0.06:
+		hc = Color(0.18, 0.18, 0.16).lerp(Color(0.48, 0.38, 0.22), t / 0.06)              # Sandy coast
+	elif t < 0.25:
+		hc = Color(0.48, 0.38, 0.22).lerp(Color(0.42, 0.30, 0.16), (t - 0.06) / 0.19)    # Low rock
 	elif t < 0.55:
-		hc = c1.lerp(c2, (t - 0.25) / 0.30)
+		hc = Color(0.42, 0.30, 0.16).lerp(Color(0.68, 0.54, 0.36), (t - 0.25) / 0.30)    # Mid rock
 	else:
-		hc = c2.lerp(c3, (t - 0.55) / 0.45)
+		hc = Color(0.68, 0.54, 0.36).lerp(Color(0.80, 0.74, 0.62), (t - 0.55) / 0.45)    # Pale stone peaks
 
-	# Steep cliff faces are darker grey
 	var cliff := Color(0.38, 0.34, 0.30)
 	var steep : float = clamp((slope - 0.25) / 0.40, 0.0, 1.0)
 	return hc.lerp(cliff, steep * 0.65)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Water sphere — transparent globe at sea level (PLANET_RADIUS + WATER_LEVEL)
+# Ocean biome terrain dips below sphere_y, making water visible there.
+# ═════════════════════════════════════════════════════════════════════════════
+func _create_water_sphere() -> void:
+	var radius := PLANET_RADIUS + WATER_LEVEL  # 11995.0
+
+	var sphere := SphereMesh.new()
+	sphere.radius          = radius
+	sphere.height          = radius * 2.0
+	sphere.radial_segments = 96
+	sphere.rings           = 64
+
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color    = Color(0.06, 0.22, 0.52, 0.70)
+	mat.transparency    = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.roughness       = 0.04
+	mat.metallic        = 0.15
+	mat.cull_mode       = BaseMaterial3D.CULL_BACK  # Outer face visible from land
+
+	var mi := MeshInstance3D.new()
+	mi.name              = "WaterSphere"
+	mi.mesh              = sphere
+	mi.material_override = mat
+	mi.position          = Vector3(0.0, -PLANET_RADIUS, 0.0)
+	mi.cast_shadow       = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(mi)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

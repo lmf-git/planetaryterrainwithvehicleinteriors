@@ -1371,8 +1371,7 @@ func _check_transitions() -> void:
 			var proxy_velocity = local_player.get_proxy_velocity()
 
 			# Calculate exit threshold based on container size with hysteresis
-			var size_scale = 3.0 * container.size_multiplier
-			var half_length = 5.0 * size_scale
+			var half_length = container.get_entrance_half_z()  # actual entrance-face Z from layout
 
 			# UNIVERSAL: Match tight vehicle hysteresis pattern (5 unit entry depth)
 			# Vehicle: entry 10-15 (5 units), exit 15.1 (0.1 past entry)
@@ -1768,11 +1767,11 @@ func _check_transitions() -> void:
 			if container_world_up.y < 0.35:
 				continue
 
-			# Calculate entrance detection zone based on container size
+			# Calculate entrance detection zone based on container layout geometry
 			var size_scale = 3.0 * container.size_multiplier
 			var half_width = 3.0 * size_scale
 			var half_height = 1.5 * size_scale
-			var half_length = 5.0 * size_scale
+			var half_length = container.get_entrance_half_z()  # true front-face Z from entrance room
 			var floor_top_y = -1.5 * size_scale + 0.1
 
 			# UNIVERSAL: Tight 5 unit entry depth (matches vehicle hysteresis)

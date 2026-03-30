@@ -174,6 +174,8 @@ func _create_world_body() -> void:
 	PhysicsServer3D.body_set_collision_layer(world_body, 1)
 	PhysicsServer3D.body_set_collision_mask(world_body, 1)
 	PhysicsServer3D.body_set_state(world_body, PhysicsServer3D.BODY_STATE_CAN_SLEEP, false)
+	# Gravity is applied manually (toward planet center) — disable engine gravity on this body
+	PhysicsServer3D.body_set_param(world_body, PhysicsServer3D.BODY_PARAM_GRAVITY_SCALE, 0.0)
 
 func _create_proxy_body() -> void:
 	# Character body for proxy interiors (vehicles/containers)
@@ -322,9 +324,16 @@ func _handle_movement(delta: float) -> void:
 	# Get current velocity
 	var velocity: Vector3 = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY)
 
-	# Apply gravity manually when in proxy interior (world space uses engine gravity)
-	if (is_in_vehicle or is_in_container) and physics_proxy and physics_proxy.gravity_enabled:
-		velocity.y -= 9.81 * delta
+	# Apply gravity manually in all spaces
+	if is_in_vehicle or is_in_container:
+		# Proxy interior: flat -Y gravity
+		if physics_proxy and physics_proxy.gravity_enabled:
+			velocity.y -= 9.81 * delta
+	else:
+		# World space: gravity toward planet center (spherical planet)
+		var body_tf: Transform3D = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
+		var to_center: Vector3 = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - body_tf.origin).normalized()
+		velocity += to_center * 9.8 * delta
 
 	# Apply horizontal movement
 	if input_direction.length() > 0:
@@ -346,7 +355,13 @@ func _handle_movement(delta: float) -> void:
 	if jump_pressed:
 		var is_grounded = _check_ground(current_body)
 		if is_grounded:
-			velocity.y = jump_force
+			if is_in_vehicle or is_in_container:
+				velocity.y = jump_force
+			else:
+				# World space: jump away from planet center
+				var body_tf2: Transform3D = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
+				var up: Vector3 = (body_tf2.origin - Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)).normalized()
+				velocity += up * jump_force
 
 	# Set velocity
 	PhysicsServer3D.body_set_state(current_body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, velocity)
@@ -392,13 +407,13 @@ func _update_character_visual_position(delta: float) -> void:
 		if game_manager:
 			for child in game_manager.get_children():
 				if child is VehicleContainer:
-					var container = child
-					var container_space = container.get_interior_space()
+					var container := child as VehicleContainer
+					var container_space: RID = container.get_interior_space()
 					# Check if this is the container the player is actually in
 					if container_space == player_space and container.exterior_body:
 						# Get the container's world transform (handles recursive nesting)
-						var container_world_transform = VehicleContainer.get_world_transform(container)
-						var container_world_basis = container_world_transform.basis
+						var container_world_transform: Transform3D = VehicleContainer.get_world_transform(container)
+						var container_world_basis: Basis = container_world_transform.basis
 
 						# Update target to track container's world orientation
 						target_visual_basis = container_world_basis
@@ -419,12 +434,12 @@ func _update_character_visual_position(delta: float) -> void:
 		if game_manager:
 			for child in game_manager.get_children():
 				if child is Vehicle:
-					var vehicle = child
+					var vehicle := child as Vehicle
 
 					# CRITICAL: If vehicle is docked, need to use dock_proxy position + container transform
 					if vehicle.is_docked and vehicle.dock_proxy_body.is_valid():
 						# Get ship's dock_proxy position in container space
-						var ship_dock_transform = PhysicsServer3D.body_get_state(vehicle.dock_proxy_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
+						var ship_dock_transform: Transform3D = PhysicsServer3D.body_get_state(vehicle.dock_proxy_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
 
 						# Transform player proxy_pos (in ship interior space) to container space
 						var container_proxy_pos = ship_dock_transform.origin + ship_dock_transform.basis * proxy_pos
@@ -538,7 +553,11 @@ func _check_ground(body: RID) -> bool:
 	# Get body position
 	var body_transform: Transform3D = PhysicsServer3D.body_get_state(body, PhysicsServer3D.BODY_STATE_TRANSFORM)
 	var from = body_transform.origin
-	var to = from + Vector3(0, -0.8, 0)  # Ray slightly longer than capsule bottom (0.7 capsule height + 0.1 buffer)
+	# "Down" toward planet center in world space; flat -Y in proxy interiors
+	var down := Vector3(0.0, -1.0, 0.0)
+	if not (is_in_vehicle or is_in_container):
+		down = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - from).normalized()
+	var to = from + down * 0.8
 
 	# Get the space the body is in
 	var space = PhysicsServer3D.body_get_space(body)
