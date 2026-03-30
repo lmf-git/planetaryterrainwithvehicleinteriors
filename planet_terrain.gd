@@ -9,22 +9,22 @@ extends Node3D
 
 # ── Tile / vertex dimensions ──────────────────────────────────────────────────
 const TILE_GRID      : int   = 16      # Quads per tile side at LOD0 → 17×17 vertices (fast build)
-const VERT_SPACING   : float = 4.0     # World units between vertices at LOD0
-const TILE_WORLD_SIZE: float = TILE_GRID * VERT_SPACING   # 64 world units
+const VERT_SPACING   : float = 16.0    # World units between vertices at LOD0
+const TILE_WORLD_SIZE: float = TILE_GRID * VERT_SPACING   # 256 world units
 
 const MAX_HEIGHT     : float = 450.0   # Dramatic NMS-style elevation range
-const PLANET_RADIUS  : float = 12000.0 # Large planet — subtle curvature, wide horizon
+const PLANET_RADIUS  : float = 50000.0 # Very large planet — negligible local curvature
 const WATER_LEVEL    : float = -5.0    # Sea surface: 5 units below sphere_y (PLANET_RADIUS + WATER_LEVEL)
 
 # ── LOD ───────────────────────────────────────────────────────────────────────
 const LOD_STEPS  : Array = [1,    2,     4,     8    ]   # Vertex stride per LOD
-const LOD_RANGES : Array = [320.0, 640.0, 1280.0, 2560.0]  # Max dist for each LOD
-const UNLOAD_RANGE       : float = 2900.0
+const LOD_RANGES : Array = [768.0, 1536.0, 3072.0, 6144.0]  # Max dist for each LOD
+const UNLOAD_RANGE       : float = 7000.0
 
 const HIGH_SPOT_THRESH : float = 40.0   # Height (world units) for "high-spot" bonus
 const HIGH_SPOT_EXTEND : float = 1.6    # Range multiplier for high-spot tiles
-const MAX_NEW_TILES    : int   = 16     # Tiles loaded per streaming tick
-const UPDATE_INTERVAL  : float = 0.15
+const MAX_NEW_TILES    : int   = 24     # Tiles loaded per streaming tick
+const UPDATE_INTERVAL  : float = 0.10
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 var tiles        : Dictionary = {}
@@ -248,6 +248,19 @@ func _update_map_camera() -> void:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+## Returns true if the tile's world-space centre is inside (or near) the camera frustum.
+## Falls back to true when no camera is available so off-screen tiles still load.
+func _is_in_frustum(tile_world_center: Vector3) -> bool:
+	if not is_instance_valid(main_camera_ref):
+		return true
+	var planes : Array[Plane] = main_camera_ref.get_frustum()
+	var margin : float = TILE_WORLD_SIZE  # allow tiles one tile-width outside edge
+	for plane in planes:
+		if plane.distance_to(tile_world_center) < -margin:
+			return false
+	return true
+
+
 # Tile streaming
 # ═════════════════════════════════════════════════════════════════════════════
 func _update_tiles() -> void:
@@ -306,10 +319,14 @@ func _update_tiles() -> void:
 			to_load.append(coord)
 
 	to_load.sort_custom(func(a: Vector2i, b: Vector2i) -> bool:
-		var da := Vector2(px, pz).distance_squared_to(
-			Vector2((a.x + 0.5) * TILE_WORLD_SIZE, (a.y + 0.5) * TILE_WORLD_SIZE))
-		var db := Vector2(px, pz).distance_squared_to(
-			Vector2((b.x + 0.5) * TILE_WORLD_SIZE, (b.y + 0.5) * TILE_WORLD_SIZE))
+		var ca := Vector3((a.x + 0.5) * TILE_WORLD_SIZE, 0.0, (a.y + 0.5) * TILE_WORLD_SIZE)
+		var cb := Vector3((b.x + 0.5) * TILE_WORLD_SIZE, 0.0, (b.y + 0.5) * TILE_WORLD_SIZE)
+		var a_vis : int = 1 if _is_in_frustum(ca) else 0
+		var b_vis : int = 1 if _is_in_frustum(cb) else 0
+		if a_vis != b_vis:
+			return a_vis > b_vis  # visible tiles first
+		var da := Vector2(px, pz).distance_squared_to(Vector2(ca.x, ca.z))
+		var db := Vector2(px, pz).distance_squared_to(Vector2(cb.x, cb.z))
 		return da < db
 	)
 
@@ -411,14 +428,15 @@ func _sample_height(wx: float, wz: float) -> float:
 	var land_h   : float = lerp(plains_h, mountain_h, mountain_mask)
 	var combined : float = lerp(ocean_h, land_h, land_blend)
 
-	# ── Spawn flat zone: flat to 500u, fades out by 700u ──────────────────────
+	# ── Spawn flat zone: y=0 within 1500u, smoothly fades to full terrain by 2000u ──
+	# Both noise AND sphere_y are suppressed so the spawn pad is geometrically flat,
+	# not just noise-free. Containers and ships land level regardless of planet curvature.
 	var dist_from_origin : float = sqrt(wx * wx + wz * wz)
-	var flat_blend : float = clamp((dist_from_origin - 500.0) / 200.0, 0.0, 1.0)
+	var flat_blend : float = clamp((dist_from_origin - 1500.0) / 500.0, 0.0, 1.0)
 	flat_blend = flat_blend * flat_blend
-	combined = combined * flat_blend
 
 	# Allow negative (ocean floor below sea level), cap at 1.0 (flat mesa tops)
-	return sphere_y + clamp(combined, -0.12, 1.0) * MAX_HEIGHT
+	return lerp(0.0, sphere_y, flat_blend) + clamp(combined, -0.12, 1.0) * MAX_HEIGHT * flat_blend
 
 
 # ═════════════════════════════════════════════════════════════════════════════
