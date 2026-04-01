@@ -100,7 +100,7 @@ func _create_vehicle_exterior() -> void:
 	# Configure rigid body
 	exterior_body.mass = 1000.0
 	exterior_body.lock_rotation = false
-	exterior_body.gravity_scale = 1.0  # Enable gravity so it sits on ground
+	exterior_body.gravity_scale = 0.0  # Manual planet-centre gravity via _apply_world_gravity()
 	exterior_body.linear_damp = 0.0
 	exterior_body.angular_damp = 0.0
 
@@ -339,7 +339,61 @@ func _process(_delta: float) -> void:
 	# Update visual every frame for smooth rendering (not just physics frames)
 	_update_vehicle_visual_position()
 
-func _physics_process(_delta: float) -> void:
+## Corner-based buoyancy. Each bottom corner submerged below the water surface
+## contributes an upward force proportional to depth. Water drag is also applied.
+const BUOY_FACTOR  : float = 2.0   # lift multiple at 1 unit submersion (>1 → object floats high)
+const WATER_DRAG   : float = 1.5   # linear / angular damp when any corner is wet
+const GRAVITY_STRENGTH : float = 20.0  # m/s² toward planet centre
+
+func _apply_world_gravity(delta: float) -> void:
+	if not exterior_body or is_docked:
+		return
+	var planet_center := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+	var to_center     := (planet_center - exterior_body.global_position).normalized()
+	# Direct velocity accumulation — identical to how the player applies gravity,
+	# so both fall at exactly the same rate.
+	exterior_body.linear_velocity += to_center * GRAVITY_STRENGTH * delta
+
+func _apply_buoyancy() -> void:
+	if not exterior_body or is_docked or not interior_layout or interior_layout.rooms.is_empty():
+		return
+
+	# Bounding box of the full layout in local space
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	for room in interior_layout.rooms:
+		var rp : Vector3 = room.get_world_position()
+		var he : Vector3 = room.get_half_extents()
+		lo = lo.min(rp - he)
+		hi = hi.max(rp + he)
+
+	var bt  : Transform3D = exterior_body.global_transform
+	# Buoyancy coefficient per corner (N per unit depth)
+	var k   : float = exterior_body.mass * 9.8 * BUOY_FACTOR * 0.25
+
+	var corners : Array[Vector3] = [
+		Vector3(lo.x, lo.y, lo.z),
+		Vector3(hi.x, lo.y, lo.z),
+		Vector3(lo.x, lo.y, hi.z),
+		Vector3(hi.x, lo.y, hi.z),
+	]
+
+	var any_wet : bool = false
+	for lc in corners:
+		var wc    : Vector3 = bt * lc
+		var wy    : float   = PlanetTerrain.water_surface_y(wc.x, wc.z)
+		var depth : float   = wy - wc.y
+		if depth > 0.0:
+			# position arg = global-space offset from body origin to corner
+			exterior_body.apply_force(Vector3(0.0, k * depth, 0.0), bt.basis * lc)
+			any_wet = true
+
+	exterior_body.linear_damp  = WATER_DRAG if any_wet else 0.0
+	exterior_body.angular_damp = WATER_DRAG if any_wet else 0.0
+
+func _physics_process(delta: float) -> void:
+	_apply_world_gravity(delta)
+	_apply_buoyancy()
 	# Multiplayer synchronization (only if multiplayer is active)
 	var has_enet_peer = multiplayer.multiplayer_peer != null and multiplayer.multiplayer_peer is ENetMultiplayerPeer
 	if has_enet_peer:

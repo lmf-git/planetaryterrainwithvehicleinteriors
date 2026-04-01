@@ -314,7 +314,7 @@ func _setup_cameras() -> void:
 	main_camera.name = "MainCamera"
 	main_camera.fov = 75
 	main_camera.near = 0.1
-	main_camera.far = 5000
+	main_camera.far = 10000
 	main_camera.current = true
 	# Set initial position so we can see something
 	main_camera.position = Vector3(0, 1.5, 0)
@@ -465,6 +465,7 @@ func _process(delta: float) -> void:
 	_update_dock_interior_camera()
 	_update_proxy_character_visuals()
 	_update_pip_visibility()
+	_update_camera_depth_range()
 
 func _update_up_direction_transition(delta: float) -> void:
 	# During space transitions, smoothly interpolate toward target
@@ -477,6 +478,27 @@ func _update_up_direction_transition(delta: float) -> void:
 	else:
 		# Not transitioning - instantly match the target (which tracks current space)
 		current_up_vector = target_up_vector
+
+## Dynamically adjusts near/far based on altitude so:
+##  - Close to surface: near=0.1, far=10 000   → good precision for interior/exterior gameplay
+##  - In deep space:    near=100, far=600 000   → planet visible, depth buffer ratio stays ~6000:1
+##
+## Near is only raised when the player is in WORLD space (not inside a vehicle/station),
+## so interior wall geometry is never clipped by an oversized near plane.
+func _update_camera_depth_range() -> void:
+	if character.is_in_vehicle or character.is_in_container:
+		main_camera.near = 0.05
+		main_camera.far  = 2000.0
+		return
+
+	var world_pos   : Vector3 = character.get_world_position()
+	var altitude    : float   = world_pos.distance_to(Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)) \
+	                            - PlanetTerrain.PLANET_RADIUS
+	# Quadratic ease: very little change on the ground, rapid change once in orbit
+	var t : float = clamp(altitude / 12000.0, 0.0, 1.0)
+	t = t * t
+	main_camera.near = lerp(0.1,    100.0,    t)
+	main_camera.far  = lerp(10000.0, 600000.0, t)
 
 func set_target_up_direction(new_up: Vector3) -> void:
 	# Set the target up direction for smooth gravity transition

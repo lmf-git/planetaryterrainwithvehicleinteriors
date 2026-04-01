@@ -129,7 +129,55 @@ func _create_container_physics_space() -> void:
 	PhysicsServer3D.area_add_shape(gravity_area, large_box_shape)
 	PhysicsServer3D.area_set_shape_transform(gravity_area, 0, Transform3D(Basis(), Vector3.ZERO))
 
-func _physics_process(_delta: float) -> void:
+## Corner-based buoyancy — identical algorithm to Vehicle.
+const BUOY_FACTOR      : float = 2.0
+const WATER_DRAG       : float = 1.5
+const GRAVITY_STRENGTH : float = 20.0
+
+func _apply_world_gravity(delta: float) -> void:
+	if not exterior_body:
+		return
+	var planet_center := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+	var to_center     := (planet_center - exterior_body.global_position).normalized()
+	exterior_body.linear_velocity += to_center * GRAVITY_STRENGTH * delta
+
+func _apply_buoyancy() -> void:
+	if not exterior_body or not interior_layout or interior_layout.rooms.is_empty():
+		return
+
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	for room in interior_layout.rooms:
+		var rp : Vector3 = room.get_world_position()
+		var he : Vector3 = room.get_half_extents()
+		lo = lo.min(rp - he)
+		hi = hi.max(rp + he)
+
+	var bt  : Transform3D = exterior_body.global_transform
+	var k   : float = exterior_body.mass * 9.8 * BUOY_FACTOR * 0.25
+
+	var corners : Array[Vector3] = [
+		Vector3(lo.x, lo.y, lo.z),
+		Vector3(hi.x, lo.y, lo.z),
+		Vector3(lo.x, lo.y, hi.z),
+		Vector3(hi.x, lo.y, hi.z),
+	]
+
+	var any_wet : bool = false
+	for lc in corners:
+		var wc    : Vector3 = bt * lc
+		var wy    : float   = PlanetTerrain.water_surface_y(wc.x, wc.z)
+		var depth : float   = wy - wc.y
+		if depth > 0.0:
+			exterior_body.apply_force(Vector3(0.0, k * depth, 0.0), bt.basis * lc)
+			any_wet = true
+
+	exterior_body.linear_damp  = WATER_DRAG if any_wet else 0.0
+	exterior_body.angular_damp = WATER_DRAG if any_wet else 0.0
+
+func _physics_process(delta: float) -> void:
+	_apply_world_gravity(delta)
+	_apply_buoyancy()
 	# Multiplayer synchronization (only if multiplayer is active)
 	var has_enet_peer = multiplayer.multiplayer_peer != null and multiplayer.multiplayer_peer is ENetMultiplayerPeer
 	if has_enet_peer:
@@ -213,7 +261,7 @@ func _create_container_exterior() -> void:
 	exterior_body = RigidBody3D.new()
 	exterior_body.name = "ExteriorBody"
 	exterior_body.mass = 50000.0 * size_multiplier  # Heavy but controllable - 50x ship mass (1000 kg)
-	exterior_body.gravity_scale = 1.0  # UNIVERSAL: Same gravity everywhere (world and all interiors)
+	exterior_body.gravity_scale = 0.0  # Manual planet-centre gravity via _apply_world_gravity()
 	exterior_body.linear_damp = 0.0
 	exterior_body.angular_damp = 0.0
 	add_child(exterior_body)

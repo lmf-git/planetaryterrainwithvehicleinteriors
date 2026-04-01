@@ -333,7 +333,35 @@ func _handle_movement(delta: float) -> void:
 		# World space: gravity toward planet center (spherical planet)
 		var body_tf: Transform3D = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
 		var to_center: Vector3 = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - body_tf.origin).normalized()
-		velocity += to_center * 9.8 * delta
+		velocity += to_center * 20.0 * delta
+
+		# ── Buoyancy: 4 bottom corners of the player capsule ──────────────────
+		# The capsule is ~0.4 radius, ~1.8 tall — corners at foot level.
+		const PLAYER_HW : float = 0.4
+		const PLAYER_HH : float = 0.9
+		var up : Vector3 = -to_center
+		var total_depth : float = 0.0
+		var wet_count   : int   = 0
+		var foot_corners : Array[Vector3] = [
+			Vector3(-PLAYER_HW, -PLAYER_HH, -PLAYER_HW),
+			Vector3( PLAYER_HW, -PLAYER_HH, -PLAYER_HW),
+			Vector3(-PLAYER_HW, -PLAYER_HH,  PLAYER_HW),
+			Vector3( PLAYER_HW, -PLAYER_HH,  PLAYER_HW),
+		]
+		for lc in foot_corners:
+			var wc    : Vector3 = body_tf * lc
+			var wy    : float   = PlanetTerrain.water_surface_y(wc.x, wc.z)
+			var depth : float   = wy - wc.y
+			if depth > 0.0:
+				total_depth += depth
+				wet_count   += 1
+		if wet_count > 0:
+			var avg_depth  : float = total_depth / float(wet_count)
+			# Buoyancy acceleration — overpowers gravity at ~0.5 unit submersion
+			velocity += up * (avg_depth * 20.0) * delta
+			# Water drag — apply after so full-speed swimmers slow gradually
+			var drag : float = 1.0 - clamp(4.0 * delta, 0.0, 0.7)
+			velocity *= drag
 
 	# Apply horizontal movement
 	if input_direction.length() > 0:

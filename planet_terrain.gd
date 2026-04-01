@@ -50,6 +50,9 @@ var map_dragging    : bool     = false
 var main_camera_ref : Camera3D
 var dual_camera_ref : DualCameraView
 
+# ── Space impostor ────────────────────────────────────────────────────────────
+var planet_impostor : MeshInstance3D
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Inner class – one heightmap tile
@@ -98,6 +101,7 @@ func _ready() -> void:
 	_setup_material()
 	_setup_map_camera()
 	_create_water_sphere()
+	_create_planet_impostor()
 
 
 func _setup_noise() -> void:
@@ -173,6 +177,20 @@ func _process(delta: float) -> void:
 		_update_tiles()
 	if map_mode:
 		_update_map_camera()
+	_update_impostor_uniforms()
+
+
+func _update_impostor_uniforms() -> void:
+	if not is_instance_valid(planet_impostor):
+		return
+	var mat := planet_impostor.material_override as ShaderMaterial
+	if not mat:
+		return
+	var altitude : float = player_pos.distance_to(Vector3(0.0, -PLANET_RADIUS, 0.0)) - PLANET_RADIUS
+	mat.set_shader_parameter("player_xz",       Vector2(player_pos.x, player_pos.z))
+	mat.set_shader_parameter("player_altitude",  altitude)
+	mat.set_shader_parameter("fade_near",        UNLOAD_RANGE * 0.55)
+	mat.set_shader_parameter("fade_far",         UNLOAD_RANGE * 0.90)
 
 
 func _input(event: InputEvent) -> void:
@@ -264,6 +282,12 @@ func _is_in_frustum(tile_world_center: Vector3) -> bool:
 # Tile streaming
 # ═════════════════════════════════════════════════════════════════════════════
 func _update_tiles() -> void:
+	# Skip tile streaming when the player is high in orbit — the impostor sphere
+	# covers the planet from space and tiles are too small to matter up there.
+	var altitude : float = player_pos.distance_to(Vector3(0.0, -PLANET_RADIUS, 0.0)) - PLANET_RADIUS
+	if altitude > UNLOAD_RANGE * 2.0:
+		return
+
 	var px    := player_pos.x
 	var pz    := player_pos.z
 	var cx    := int(floor(px / TILE_WORLD_SIZE))
@@ -508,27 +532,22 @@ func _build_mesh(t: HeightmapTile, lod: int) -> void:
 	t.mesh_instance.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(t.mesh_instance)
 
-	# ── Collision (LOD0 + LOD1, trimesh) — LOD1 safety net prevents fall-through ─
-	if lod <= 1:
-		t.static_body          = StaticBody3D.new()
-		t.static_body.position = t.origin
-		add_child(t.static_body)
+	# ── Collision (HeightMapShape3D — volumetric, immune to tunneling at any speed) ─
+	# Always built from full LOD0 heights (17×17) regardless of mesh LOD.
+	t.static_body          = StaticBody3D.new()
+	# HeightMapShape3D is centred, so position the body at the tile's world-space midpoint.
+	t.static_body.position = t.origin + Vector3(TILE_WORLD_SIZE * 0.5, 0.0, TILE_WORLD_SIZE * 0.5)
+	# Scale XZ so each 1-unit cell maps to VERT_SPACING world units; Y stays 1:1.
+	t.static_body.scale    = Vector3(VERT_SPACING, 1.0, VERT_SPACING)
+	add_child(t.static_body)
 
-		var cv := PackedVector3Array()
-		for zi in range(n):
-			for xi in range(n):
-				var v00 := verts[ zi      * (n + 1) + xi    ]
-				var v10 := verts[ zi      * (n + 1) + xi + 1]
-				var v01 := verts[(zi + 1) * (n + 1) + xi    ]
-				var v11 := verts[(zi + 1) * (n + 1) + xi + 1]
-				cv.append_array([v00, v10, v01, v10, v11, v01])
-
-		var cs    := CollisionShape3D.new()
-		var shape := ConcavePolygonShape3D.new()
-		shape.backface_collision = true   # Collide from both sides as a safety net
-		shape.set_faces(cv)
-		cs.shape = shape
-		t.static_body.add_child(cs)
+	var cs    := CollisionShape3D.new()
+	var shape := HeightMapShape3D.new()
+	shape.map_width = TILE_GRID + 1   # 17 columns (x)
+	shape.map_depth = TILE_GRID + 1   # 17 rows    (z)
+	shape.map_data  = t.heights       # 17×17 LOD0 heights, row-major (z outer, x inner)
+	cs.shape = shape
+	t.static_body.add_child(cs)
 
 	t.current_lod = lod
 	t.dirty       = false
@@ -562,8 +581,19 @@ func _terrain_color(h: float, normal: Vector3) -> Color:
 # Water sphere — transparent globe at sea level (PLANET_RADIUS + WATER_LEVEL)
 # Ocean biome terrain dips below sphere_y, making water visible there.
 # ═════════════════════════════════════════════════════════════════════════════
+## Returns world-space Y of the water surface at (wx, wz).
+## The water sphere is centred at (0, -PLANET_RADIUS, 0) with radius = PLANET_RADIUS + WATER_LEVEL.
+## Returns -PLANET_RADIUS (far below the surface) for points outside the sphere boundary.
+static func water_surface_y(wx: float, wz: float) -> float:
+	var water_r : float = PLANET_RADIUS + WATER_LEVEL
+	var r2 : float = wx * wx + wz * wz
+	if r2 >= water_r * water_r:
+		return -PLANET_RADIUS
+	return sqrt(water_r * water_r - r2) - PLANET_RADIUS
+
+
 func _create_water_sphere() -> void:
-	var radius := PLANET_RADIUS + WATER_LEVEL  # 11995.0
+	var radius : float = PLANET_RADIUS + WATER_LEVEL
 
 	var sphere := SphereMesh.new()
 	sphere.radius          = radius
@@ -585,6 +615,110 @@ func _create_water_sphere() -> void:
 	mi.position          = Vector3(0.0, -PLANET_RADIUS, 0.0)
 	mi.cast_shadow       = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(mi)
+
+
+## Full-planet impostor sphere — always present, depth-tested below terrain tiles.
+## Viewed from space it shows the whole planet; near the surface it is occluded by tiles.
+## Slightly smaller than PLANET_RADIUS to avoid Z-fighting at the tile boundary.
+func _create_planet_impostor() -> void:
+	var radius : float = PLANET_RADIUS - 10.0
+
+	var sphere := SphereMesh.new()
+	sphere.radius          = radius
+	sphere.height          = radius * 2.0
+	sphere.radial_segments = 180
+	sphere.rings           = 90
+
+	# Shader: triplanar noise gives a seamless continent/ocean pattern.
+	# local_pos (= local vertex position on the unit sphere) is passed as a varying
+	# so the fragment shader can do stable UV-free texturing.
+	var shader := Shader.new()
+	shader.code = """
+shader_type spatial;
+render_mode cull_back, diffuse_lambert, blend_mix, depth_draw_never;
+
+uniform sampler2D noise_tex : hint_default_white, repeat_enable;
+
+// Set each frame by PlanetTerrain._update_impostor_uniforms()
+uniform vec2  player_xz       = vec2(0.0);
+uniform float player_altitude = 0.0;
+uniform float fade_near       = 3500.0;  // tiles fully present inside this XZ radius
+uniform float fade_far        = 6000.0;  // tiles absent beyond this XZ radius
+
+varying vec3 local_pos;
+
+void vertex() {
+	local_pos = VERTEX;
+}
+
+void fragment() {
+	vec3 n = normalize(local_pos);
+
+	// Triplanar blend weights
+	vec3 w = pow(abs(n), vec3(6.0));
+	w /= w.x + w.y + w.z;
+
+	// Two-scale noise for continents + detail
+	float s_x = texture(noise_tex, n.yz * 0.45).r * 0.7
+	          + texture(noise_tex, n.yz * 1.80 + 0.31).r * 0.3;
+	float s_y = texture(noise_tex, n.xz * 0.45).r * 0.7
+	          + texture(noise_tex, n.xz * 1.80 + 0.47).r * 0.3;
+	float s_z = texture(noise_tex, n.xy * 0.45).r * 0.7
+	          + texture(noise_tex, n.xy * 1.80 + 0.63).r * 0.3;
+	float land = s_x * w.x + s_y * w.y + s_z * w.z;
+
+	float t_coast = smoothstep(0.46, 0.56, land);
+	float t_mount = smoothstep(0.70, 0.82, land);
+	float t_polar = smoothstep(0.76, 0.93, abs(n.y));
+
+	vec3 col = mix(vec3(0.05, 0.20, 0.50), vec3(0.16, 0.44, 0.11), t_coast);
+	col = mix(col, vec3(0.40, 0.36, 0.22), t_mount);
+	col = mix(col, vec3(0.88, 0.93, 1.00), t_polar);
+
+	ALBEDO    = col;
+	ROUGHNESS = mix(0.04, 0.88, t_coast);
+	METALLIC  = 0.0;
+
+	// ── Alpha fade ────────────────────────────────────────────────────────────
+	// local_pos.xz ≈ world XZ (sphere centre is at world (0, -R, 0))
+	float dist_xz = length(local_pos.xz - player_xz);
+
+	// Where terrain tiles exist (near player XZ) the sphere should be invisible.
+	// Where tiles are absent it should be fully visible.
+	float terrain_alpha = smoothstep(fade_near, fade_far, dist_xz);
+
+	// Altitude override: in orbit the full sphere is always shown.
+	float alt_t = clamp(player_altitude / 8000.0, 0.0, 1.0);
+	alt_t = alt_t * alt_t;
+
+	ALPHA = mix(terrain_alpha, 1.0, alt_t);
+}
+"""
+
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+
+	# Build a seamless noise texture using the same base noise seed as the terrain
+	var noise_tex := NoiseTexture2D.new()
+	noise_tex.width    = 512
+	noise_tex.height   = 512
+	noise_tex.seamless = true
+	var fn := FastNoiseLite.new()
+	fn.noise_type      = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	fn.seed            = noise_base.seed if noise_base else 42
+	fn.frequency       = 0.6
+	fn.fractal_type    = FastNoiseLite.FRACTAL_FBM
+	fn.fractal_octaves = 6
+	noise_tex.noise = fn
+	mat.set_shader_parameter("noise_tex", noise_tex)
+
+	planet_impostor = MeshInstance3D.new()
+	planet_impostor.name              = "PlanetImpostor"
+	planet_impostor.mesh              = sphere
+	planet_impostor.material_override = mat
+	planet_impostor.position          = Vector3(0.0, -PLANET_RADIUS, 0.0)
+	planet_impostor.cast_shadow       = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	add_child(planet_impostor)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
