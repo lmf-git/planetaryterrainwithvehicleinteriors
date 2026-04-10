@@ -12,6 +12,7 @@ var last_mp_ui_state: String = ""  # Track last UI state to avoid spam
 
 # Terrain
 var planet_terrain: PlanetTerrain
+var city_generator: CityGenerator
 
 # Planetary gravity (kept alive so the RID shape stays valid)
 var _planet_gravity_shape: SphereShape3D
@@ -100,15 +101,9 @@ func _debounced_log(category: String, message: String, data: Dictionary) -> void
 	last_ship_station_log[cache_key] = {"time": current_time, "data": data}
 
 func _ready() -> void:
-	# Setup environment immediately (visible while dialog is shown)
+	# Only show the menu — no terrain or objects until the player picks a mode
 	_create_lighting()
 	_create_stars()
-
-	planet_terrain = PlanetTerrain.new()
-	planet_terrain.name = "PlanetTerrain"
-	add_child(planet_terrain)
-
-	_create_instructions_ui()
 
 	# Release mouse so the dialog buttons are clickable
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
@@ -194,6 +189,18 @@ func _init_game(mode: String) -> void:
 	print("[DEBUG] ========================================")
 	print("[DEBUG] _init_game() mode=%s" % mode)
 	print("[DEBUG] ========================================")
+
+	# Terrain and city — deferred until a mode is chosen
+	planet_terrain = PlanetTerrain.new()
+	planet_terrain.name = "PlanetTerrain"
+	add_child(planet_terrain)
+
+	city_generator = CityGenerator.new()
+	city_generator.name = "CityGenerator"
+	add_child(city_generator)
+	city_generator.setup(planet_terrain)
+
+	_create_instructions_ui()
 
 	# Create physics proxy
 	physics_proxy = PhysicsProxy.new()

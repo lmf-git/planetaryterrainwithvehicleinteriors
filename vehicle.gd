@@ -345,14 +345,20 @@ const BUOY_FACTOR  : float = 2.0   # lift multiple at 1 unit submersion (>1 → 
 const WATER_DRAG   : float = 1.5   # linear / angular damp when any corner is wet
 const GRAVITY_STRENGTH : float = 20.0  # m/s² toward planet centre
 
+const TERMINAL_VELOCITY : float = 40.0  # m/s atmospheric terminal velocity
+
 func _apply_world_gravity(delta: float) -> void:
 	if not exterior_body or is_docked:
 		return
 	var planet_center := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
 	var to_center     := (planet_center - exterior_body.global_position).normalized()
-	# Direct velocity accumulation — identical to how the player applies gravity,
-	# so both fall at exactly the same rate.
 	exterior_body.linear_velocity += to_center * GRAVITY_STRENGTH * delta
+
+	# Atmospheric drag — matches player formula exactly (dead zone below 5 m/s).
+	var fall_speed : float = exterior_body.linear_velocity.dot(to_center)
+	if fall_speed > 5.0:
+		var drag_accel : float = ((fall_speed - 5.0) / (TERMINAL_VELOCITY - 5.0)) * GRAVITY_STRENGTH
+		exterior_body.linear_velocity -= to_center * drag_accel * delta
 
 func _apply_buoyancy() -> void:
 	if not exterior_body or is_docked or not interior_layout or interior_layout.rooms.is_empty():

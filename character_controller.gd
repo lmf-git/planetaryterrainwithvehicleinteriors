@@ -7,7 +7,7 @@ extends Node3D
 @export var physics_proxy: PhysicsProxy
 @export var move_speed: float = 5.0
 @export var run_speed: float = 10.0
-@export var jump_force: float = 8.0
+@export var jump_force: float = 5.0
 
 # Multiplayer
 var player_id: int = 1  # Set by GameManager on spawn
@@ -23,6 +23,7 @@ var last_sync_pos: Vector3 = Vector3.ZERO
 var sync_frame_count: int = 0
 
 # Character bodies
+var world_body_node: RigidBody3D  # Node wrapper so continuous_cd is accessible
 var world_body: RID  # Character in main world (when outside vehicles)
 var proxy_body: RID  # Character in proxy interior (when inside vehicles)
 var character_visual: MeshInstance3D  # Character mesh
@@ -146,36 +147,33 @@ func _create_character_visual() -> void:
 	add_child(character_visual)
 
 func _create_world_body() -> void:
-	# Character body in main world (for when outside vehicles)
-	if not physics_proxy:
-		push_warning("PhysicsProxy not assigned to CharacterController")
-		return
+	# PhysicsServer3D.BODY_FLAG_CONTINUOUS_COLLISION_DETECTION is not exposed to GDScript in
+	# Godot 4.7, so we use a RigidBody3D node which does expose continuous_cd.
+	# All existing PhysicsServer3D calls still work via world_body_node.get_rid().
+	world_body_node = RigidBody3D.new()
+	world_body_node.name = "WorldBody"
+	world_body_node.gravity_scale = 0.0   # Manual spherical gravity applied in _handle_movement
+	world_body_node.lock_rotation = true  # No tumbling
+	world_body_node.continuous_cd = true  # Sweep capsule each frame — no tunneling through terrain
+	world_body_node.can_sleep = false
+	world_body_node.collision_layer = 1
+	world_body_node.collision_mask = 1
+	world_body_node.linear_damp = 0.0
+	world_body_node.angular_damp = 0.0
 
-	var world_space = physics_proxy.get_world_space()
+	var capsule := CapsuleShape3D.new()
+	capsule.radius = 0.3
+	capsule.height = 1.4
+	var cs := CollisionShape3D.new()
+	cs.shape = capsule
+	world_body_node.add_child(cs)
 
-	var capsule_shape := PhysicsServer3D.capsule_shape_create()
-	PhysicsServer3D.shape_set_data(capsule_shape, {"radius": 0.3, "height": 1.4})
+	add_child(world_body_node)
+	world_body = world_body_node.get_rid()
 
-	world_body = PhysicsServer3D.body_create()
-	PhysicsServer3D.body_set_mode(world_body, PhysicsServer3D.BODY_MODE_RIGID)
-	PhysicsServer3D.body_set_space(world_body, world_space)
-	PhysicsServer3D.body_add_shape(world_body, capsule_shape)
-
-	# Use parent position for initial spawn
-	var spawn_pos = global_position
-	PhysicsServer3D.body_set_state(world_body, PhysicsServer3D.BODY_STATE_TRANSFORM, Transform3D(Basis(), spawn_pos))
-
-	# Lock rotations for character
-	PhysicsServer3D.body_set_axis_lock(world_body, PhysicsServer3D.BODY_AXIS_ANGULAR_X, true)
-	PhysicsServer3D.body_set_axis_lock(world_body, PhysicsServer3D.BODY_AXIS_ANGULAR_Y, true)
-	PhysicsServer3D.body_set_axis_lock(world_body, PhysicsServer3D.BODY_AXIS_ANGULAR_Z, true)
-
-	# Enable collision settings
-	PhysicsServer3D.body_set_collision_layer(world_body, 1)
-	PhysicsServer3D.body_set_collision_mask(world_body, 1)
-	PhysicsServer3D.body_set_state(world_body, PhysicsServer3D.BODY_STATE_CAN_SLEEP, false)
-	# Gravity is applied manually (toward planet center) — disable engine gravity on this body
-	PhysicsServer3D.body_set_param(world_body, PhysicsServer3D.BODY_PARAM_GRAVITY_SCALE, 0.0)
+	# Position at spawn point
+	PhysicsServer3D.body_set_state(world_body, PhysicsServer3D.BODY_STATE_TRANSFORM,
+			Transform3D(Basis(), global_position))
 
 func _create_proxy_body() -> void:
 	# Character body for proxy interiors (vehicles/containers)
@@ -324,6 +322,10 @@ func _handle_movement(delta: float) -> void:
 	# Get current velocity
 	var velocity: Vector3 = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY)
 
+	# Track grounded state and gravity direction for movement section below
+	var is_grounded := false
+	var to_center   := Vector3.DOWN   # updated in world-space branch
+
 	# Apply gravity manually in all spaces
 	if is_in_vehicle or is_in_container:
 		# Proxy interior: flat -Y gravity
@@ -332,8 +334,17 @@ func _handle_movement(delta: float) -> void:
 	else:
 		# World space: gravity toward planet center (spherical planet)
 		var body_tf: Transform3D = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
-		var to_center: Vector3 = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - body_tf.origin).normalized()
+		to_center = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - body_tf.origin).normalized()
 		velocity += to_center * 20.0 * delta
+
+		# Atmospheric drag — no effect below DRAG_START so slow movements are unaffected.
+		# Above it, drag scales linearly to equal gravity at TERMINAL_VELOCITY (40 m/s).
+		const TERMINAL_VELOCITY : float = 40.0
+		const DRAG_START        : float = 5.0
+		var fall_speed : float = velocity.dot(to_center)   # positive = falling inward
+		if fall_speed > DRAG_START:
+			var drag_accel : float = ((fall_speed - DRAG_START) / (TERMINAL_VELOCITY - DRAG_START)) * 20.0
+			velocity -= to_center * drag_accel * delta
 
 		# ── Buoyancy: 4 bottom corners of the player capsule ──────────────────
 		# The capsule is ~0.4 radius, ~1.8 tall — corners at foot level.
@@ -357,32 +368,67 @@ func _handle_movement(delta: float) -> void:
 				wet_count   += 1
 		if wet_count > 0:
 			var avg_depth  : float = total_depth / float(wet_count)
-			# Buoyancy acceleration — overpowers gravity at ~0.5 unit submersion
-			velocity += up * (avg_depth * 20.0) * delta
+			# Cap effective depth so being far underwater doesn't launch the player
+			# violently past the surface. Equilibrium: buoyancy = gravity at 1 unit depth.
+			var buoy_depth : float = minf(avg_depth, 2.0)
+			velocity += up * (buoy_depth * 20.0) * delta
 			# Water drag — apply after so full-speed swimmers slow gradually
 			var drag : float = 1.0 - clamp(4.0 * delta, 0.0, 0.7)
 			velocity *= drag
 
+	# Grounded check — used to switch between tight ground control and airborne 6DOF
+	is_grounded = _check_ground(current_body)
+
 	# Apply horizontal movement
-	if input_direction.length() > 0:
-		var current_speed = run_speed if is_running else move_speed
-		var move_vec = input_direction.normalized() * current_speed
-		velocity.x = move_vec.x
-		velocity.z = move_vec.z
+	# Grounded (or proxy interior): hard-override lateral velocity for tight ground control.
+	# Airborne (world space, not grounded): gentle 6DOF air-control — add acceleration without
+	# zeroing momentum so the player drifts naturally while still being steerable.
+	if is_in_vehicle or is_in_container:
+		if input_direction.length() > 0:
+			var current_speed = run_speed if is_running else move_speed
+			var move_vec = input_direction.normalized() * current_speed
+			velocity.x = move_vec.x
+			velocity.z = move_vec.z
+		else:
+			velocity.x = lerp(velocity.x, 0.0, 0.5)
+			velocity.z = lerp(velocity.z, 0.0, 0.5)
+			if abs(velocity.x) < 0.1:
+				velocity.x = 0.0
+			if abs(velocity.z) < 0.1:
+				velocity.z = 0.0
+	elif is_grounded:
+		if input_direction.length() > 0:
+			var current_speed = run_speed if is_running else move_speed
+			var move_vec = input_direction.normalized() * current_speed
+			velocity.x = move_vec.x
+			velocity.z = move_vec.z
+		else:
+			velocity.x = lerp(velocity.x, 0.0, 0.5)
+			velocity.z = lerp(velocity.z, 0.0, 0.5)
+			if abs(velocity.x) < 0.1:
+				velocity.x = 0.0
+			if abs(velocity.z) < 0.1:
+				velocity.z = 0.0
 	else:
-		# Strong damping when not moving to prevent sliding
-		velocity.x = lerp(velocity.x, 0.0, 0.5)
-		velocity.z = lerp(velocity.z, 0.0, 0.5)
-		# Stop completely if velocity is very small
-		if abs(velocity.x) < 0.1:
-			velocity.x = 0.0
-		if abs(velocity.z) < 0.1:
-			velocity.z = 0.0
+		# Airborne 6DOF: accelerate toward input direction; preserve existing momentum.
+		if input_direction.length() > 0:
+			const AIR_ACCEL       : float = 15.0
+			const AIR_MAX_LATERAL : float = 20.0
+			var up := -to_center
+			# Strip gravity-aligned component so input stays on the surface plane
+			var lateral_input := input_direction - up * input_direction.dot(up)
+			if lateral_input.length() > 0.001:
+				velocity += lateral_input.normalized() * AIR_ACCEL * delta
+				# Cap lateral speed so the player can't accelerate indefinitely in air
+				var fall_component := to_center * velocity.dot(to_center)
+				var lat_vel        := velocity - fall_component
+				if lat_vel.length() > AIR_MAX_LATERAL:
+					velocity = lat_vel.normalized() * AIR_MAX_LATERAL + fall_component
 
 	# Jump (only when on ground - use raycast)
 	if jump_pressed:
-		var is_grounded = _check_ground(current_body)
-		if is_grounded:
+		var can_jump = _check_ground(current_body)
+		if can_jump:
 			if is_in_vehicle or is_in_container:
 				velocity.y = jump_force
 			else:
@@ -585,7 +631,7 @@ func _check_ground(body: RID) -> bool:
 	var down := Vector3(0.0, -1.0, 0.0)
 	if not (is_in_vehicle or is_in_container):
 		down = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - from).normalized()
-	var to = from + down * 0.8
+	var to = from + down * 1.15  # capsule bottom (1.0) + small skin
 
 	# Get the space the body is in
 	var space = PhysicsServer3D.body_get_space(body)
