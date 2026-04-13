@@ -794,16 +794,23 @@ func _update_debug_ui() -> void:
 	if has_enet_peer:
 		player_info = "Players: %d | ID: %d | " % [players.size(), local_player.player_id if local_player else 0]
 
+	var water_str  = "IN WATER" if local_player.debug_in_water  else "dry"
+	var ground_str = "GROUNDED" if local_player.debug_grounded  else "airborne"
+	var depth_val  = local_player.debug_water_depth
+	var depth_str  = "depth %.2fm" % depth_val if depth_val > -9999.0 else ""
+
 	debug_label.text = """=== DEBUG INFO ===
 %sFPS: %.0f | Spaces: %d
 Location: %s
 World Pos: (%.1f, %.1f, %.1f)
+Physics: %s | %s | %s
 %s""" % [
 		player_info,
 		fps_counter,
 		active_spaces,
 		detailed_location,
 		world_pos.x, world_pos.y, world_pos.z,
+		water_str, ground_str, depth_str,
 		proxy_info
 	]
 

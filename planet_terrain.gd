@@ -755,7 +755,12 @@ func _surface_height(wx: float, wz: float) -> float:
 	var flat_blend : float = clamp((dist_from_origin - FLAT_RADIUS) / 150.0, 0.0, 1.0)
 	flat_blend = flat_blend * flat_blend
 
-	var h : float = lerpf(0.0, sphere_y, flat_blend) + clampf(combined, -0.12, 1.0) * MAX_HEIGHT * flat_blend
+	# Use sphere_y (not 0.0) as the flat-zone baseline so the zone follows the
+	# planet sphere surface. The water sphere is always |WATER_LEVEL| below
+	# sphere_y everywhere, giving a constant 5 m gap. With the old 0.0 baseline
+	# the gap grew to ~27 m at r=1500 m, so destroyed terrain sat above the
+	# water sphere at the edges → player walked on water / varying submersion.
+	var h : float = sphere_y + clampf(combined, -0.12, 1.0) * MAX_HEIGHT * flat_blend
 
 	# City flat zones
 	for zone in _city_flat_zones:
@@ -1006,12 +1011,66 @@ func _create_water_sphere() -> void:
 	sphere.height          = radius * 2.0
 	sphere.radial_segments = 96
 	sphere.rings           = 64
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.06, 0.22, 0.52, 0.70)
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.roughness    = 0.04
-	mat.metallic     = 0.15
-	mat.cull_mode    = BaseMaterial3D.CULL_BACK
+
+	# Ray-sphere shader: each fragment ray-casts to the exact mathematical sphere so
+	# the visible water surface is pixel-perfect regardless of polygon faceting.
+	# A SphereMesh at radius 50 000 m with 96×64 segments sags up to ~13 m at triangle
+	# midpoints — far more than WATER_LEVEL (-5 m) — which made the player appear to
+	# float above the visible mesh while buoyancy (which uses the exact radius) was correct.
+	var shader := Shader.new()
+	shader.code = """
+shader_type spatial;
+render_mode blend_mix, depth_draw_never, cull_disabled;
+
+uniform vec3  sphere_center;
+uniform float sphere_radius;
+
+varying vec3 world_pos;
+
+void vertex() {
+    world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+}
+
+void fragment() {
+    vec3  cam = INV_VIEW_MATRIX[3].xyz;
+    vec3  d   = normalize(world_pos - cam);
+    vec3  oc  = cam - sphere_center;
+    float b   = dot(oc, d);
+    float c   = dot(oc, oc) - sphere_radius * sphere_radius;
+    float h   = b * b - c;
+    if (h < 0.0) discard;
+
+    float sh = sqrt(h);
+    float t;
+
+    if (c < 0.0) {
+        // Camera is inside the sphere (underwater) — render the far exit intersection.
+        // All sphere polygons appear back-facing from inside, FRONT_FACING = false.
+        t = -b + sh;
+    } else {
+        // Camera is outside — render the near entry intersection.
+        // Discard back-face fragments (far hemisphere) to avoid double-blending.
+        if (!FRONT_FACING) discard;
+        t = -b - sh;
+    }
+    if (t <= 0.0) discard;
+
+    vec3 hit = cam + t * d;
+    vec3 N   = normalize(hit - sphere_center);
+
+    ALBEDO    = vec3(0.06, 0.22, 0.52);
+    ALPHA     = 0.70;
+    NORMAL    = normalize(mat3(VIEW_MATRIX) * N);
+    ROUGHNESS = 0.04;
+    METALLIC  = 0.15;
+}
+"""
+
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	mat.set_shader_parameter("sphere_center", Vector3(0.0, -PLANET_RADIUS, 0.0))
+	mat.set_shader_parameter("sphere_radius", radius)
+
 	var mi := MeshInstance3D.new()
 	mi.name              = "WaterSphere"
 	mi.mesh              = sphere

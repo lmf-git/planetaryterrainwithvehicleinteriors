@@ -31,6 +31,9 @@ var character_visual: MeshInstance3D  # Character mesh
 # State
 var is_in_vehicle: bool = false  # Start OUTSIDE vehicle
 var is_in_container: bool = false
+var debug_grounded:    bool  = false
+var debug_in_water:    bool  = false
+var debug_water_depth: float = 0.0   # radial depth of body centre below water surface (negative = above)
 var current_space: String = "space"  # Start in world space: 'vehicle_interior', 'space', 'container_interior'
 var transition_lock: bool = false  # Prevents movement during transition frame
 
@@ -323,8 +326,9 @@ func _handle_movement(delta: float) -> void:
 	var velocity: Vector3 = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY)
 
 	# Track grounded state and gravity direction for movement section below
-	var is_grounded := false
-	var to_center   := Vector3.DOWN   # updated in world-space branch
+	var is_grounded  := false
+	var is_in_water  := false
+	var to_center    := Vector3.DOWN   # updated in world-space branch
 
 	# Apply gravity manually in all spaces
 	if is_in_vehicle or is_in_container:
@@ -347,12 +351,16 @@ func _handle_movement(delta: float) -> void:
 			velocity -= to_center * drag_accel * delta
 
 		# ── Buoyancy: 4 bottom corners of the player capsule ──────────────────
-		# The capsule is ~0.4 radius, ~1.8 tall — corners at foot level.
-		const PLAYER_HW : float = 0.4
-		const PLAYER_HH : float = 0.9
-		var up : Vector3 = -to_center
-		var total_depth : float = 0.0
-		var wet_count   : int   = 0
+		# Depth is measured radially from the planet centre so it is correct at
+		# any latitude and naturally follows the sphere — no Y-axis approximation
+		# and no curvature-correction hack needed.
+		const PLAYER_HW  : float = 0.4
+		const PLAYER_HH  : float = 0.7  # matches capsule half-height
+		var up           : Vector3 = -to_center
+		var planet_c     : Vector3 = Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+		var water_r      : float   = PlanetTerrain.PLANET_RADIUS + PlanetTerrain.WATER_LEVEL
+		var total_depth  : float   = 0.0
+		var wet_count    : int     = 0
 		var foot_corners : Array[Vector3] = [
 			Vector3(-PLAYER_HW, -PLAYER_HH, -PLAYER_HW),
 			Vector3( PLAYER_HW, -PLAYER_HH, -PLAYER_HW),
@@ -361,8 +369,7 @@ func _handle_movement(delta: float) -> void:
 		]
 		for lc in foot_corners:
 			var wc    : Vector3 = body_tf * lc
-			var wy    : float   = PlanetTerrain.water_surface_y(wc.x, wc.z)
-			var depth : float   = wy - wc.y
+			var depth : float   = water_r - wc.distance_to(planet_c)
 			if depth > 0.0:
 				total_depth += depth
 				wet_count   += 1
@@ -372,9 +379,17 @@ func _handle_movement(delta: float) -> void:
 			# violently past the surface. Equilibrium: buoyancy = gravity at 1 unit depth.
 			var buoy_depth : float = minf(avg_depth, 2.0)
 			velocity += up * (buoy_depth * 20.0) * delta
-			# Water drag — apply after so full-speed swimmers slow gradually
-			var drag : float = 1.0 - clamp(4.0 * delta, 0.0, 0.7)
-			velocity *= drag
+			# Split drag into vertical and horizontal components.
+			# Vertical: overdamped (c≈10 > c_crit≈8.9) to kill oscillation after
+			# high-speed entries — stops the player from bouncing above the sphere.
+			# Horizontal: light drag so swimming stays responsive.
+			var vert  : float  = velocity.dot(up)
+			var horiz : Vector3 = velocity - up * vert
+			vert  *= 1.0 - clamp(10.0 * delta, 0.0, 0.95)
+			horiz *= 1.0 - clamp(3.0 * delta, 0.0, 0.70)
+			velocity = horiz + up * vert
+			is_in_water = true
+
 
 	# Grounded check — used to switch between tight ground control and airborne 6DOF
 	is_grounded = _check_ground(current_body)
@@ -396,7 +411,7 @@ func _handle_movement(delta: float) -> void:
 				velocity.x = 0.0
 			if abs(velocity.z) < 0.1:
 				velocity.z = 0.0
-	elif is_grounded:
+	elif is_grounded and not is_in_water:
 		if input_direction.length() > 0:
 			var current_speed = run_speed if is_running else move_speed
 			var move_vec = input_direction.normalized() * current_speed
@@ -436,6 +451,14 @@ func _handle_movement(delta: float) -> void:
 				var body_tf2: Transform3D = PhysicsServer3D.body_get_state(current_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
 				var up: Vector3 = (body_tf2.origin - Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)).normalized()
 				velocity += up * jump_force
+
+	# Expose state for debug display
+	debug_grounded = is_grounded
+	debug_in_water  = is_in_water
+	if world_body.is_valid() and not (is_in_vehicle or is_in_container):
+		var _dbg_tf : Transform3D = PhysicsServer3D.body_get_state(world_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
+		var _planet_c := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+		debug_water_depth = (PlanetTerrain.PLANET_RADIUS + PlanetTerrain.WATER_LEVEL) - _dbg_tf.origin.distance_to(_planet_c)
 
 	# Set velocity
 	PhysicsServer3D.body_set_state(current_body, PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, velocity)
@@ -553,11 +576,28 @@ func _update_character_visual_position(delta: float) -> void:
 		var world_transform: Transform3D = PhysicsServer3D.body_get_state(world_body, PhysicsServer3D.BODY_STATE_TRANSFORM)
 		character_visual.global_position = world_transform.origin
 
-		# Update target to world up
-		target_visual_basis = Basis.IDENTITY
+		# Orient visual along local planetary up so the capsule stands perpendicular
+		# to the sphere surface.  Without this the world-Y-aligned capsule tilts
+		# relative to the water/terrain surface as the player moves away from the
+		# spawn pole, making the waterline appear at different heights.
+		var planet_c_v := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+		var local_up   := (world_transform.origin - planet_c_v).normalized()
+		var ref_right  := Vector3.RIGHT
+		if abs(local_up.dot(ref_right)) > 0.9:
+			ref_right = Vector3.FORWARD
+		var local_z    := local_up.cross(ref_right).normalized()
+		var local_x    := local_z.cross(local_up).normalized()
+		var planet_basis := Basis(local_x, local_up, -local_z)
 
-		# Use transitioning basis (smoothly follows target)
-		character_visual.global_transform.basis = current_visual_basis
+		target_visual_basis = planet_basis
+
+		# When not mid-transition keep current_visual_basis in sync so any
+		# subsequent vehicle-entry slerp starts from the correct orientation.
+		if not is_reorienting:
+			current_visual_basis = planet_basis
+			character_visual.global_transform.basis = planet_basis
+		else:
+			character_visual.global_transform.basis = current_visual_basis
 
 	# Character visibility handled by camera system
 	# Don't set visibility here - let dual_camera_view control it
@@ -631,7 +671,7 @@ func _check_ground(body: RID) -> bool:
 	var down := Vector3(0.0, -1.0, 0.0)
 	if not (is_in_vehicle or is_in_container):
 		down = (Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0) - from).normalized()
-	var to = from + down * 1.15  # capsule bottom (1.0) + small skin
+	var to = from + down * 0.80  # capsule half-height (0.7) + 0.1 skin
 
 	# Get the space the body is in
 	var space = PhysicsServer3D.body_get_space(body)
