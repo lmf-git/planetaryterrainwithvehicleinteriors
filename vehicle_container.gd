@@ -160,23 +160,26 @@ func _apply_buoyancy() -> void:
 		lo = lo.min(rp - he)
 		hi = hi.max(rp + he)
 
-	var bt  : Transform3D = exterior_body.global_transform
-	var k   : float = exterior_body.mass * 9.8 * BUOY_FACTOR * 0.25
+	var bt          : Transform3D = exterior_body.global_transform
+	var planet_c    : Vector3     = Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+	var water_r     : float       = PlanetTerrain.PLANET_RADIUS + PlanetTerrain.WATER_LEVEL
+	var body_up     : Vector3     = (exterior_body.global_position - planet_c).normalized()
+	var k           : float       = exterior_body.mass * 9.8 * BUOY_FACTOR * 0.125  # 8 corners
 
+	# All 8 corners — radial depth determines submersion at any latitude.
 	var corners : Array[Vector3] = [
-		Vector3(lo.x, lo.y, lo.z),
-		Vector3(hi.x, lo.y, lo.z),
-		Vector3(lo.x, lo.y, hi.z),
-		Vector3(hi.x, lo.y, hi.z),
+		Vector3(lo.x, lo.y, lo.z), Vector3(hi.x, lo.y, lo.z),
+		Vector3(lo.x, lo.y, hi.z), Vector3(hi.x, lo.y, hi.z),
+		Vector3(lo.x, hi.y, lo.z), Vector3(hi.x, hi.y, lo.z),
+		Vector3(lo.x, hi.y, hi.z), Vector3(hi.x, hi.y, hi.z),
 	]
 
 	var any_wet : bool = false
 	for lc in corners:
 		var wc    : Vector3 = bt * lc
-		var wy    : float   = PlanetTerrain.water_surface_y(wc.x, wc.z)
-		var depth : float   = wy - wc.y
+		var depth : float   = water_r - wc.distance_to(planet_c)
 		if depth > 0.0:
-			exterior_body.apply_force(Vector3(0.0, k * depth, 0.0), bt.basis * lc)
+			exterior_body.apply_force(body_up * k * depth, wc - exterior_body.global_position)
 			any_wet = true
 
 	exterior_body.linear_damp  = WATER_DRAG if any_wet else 0.0

@@ -350,10 +350,11 @@ func _handle_movement(delta: float) -> void:
 			var drag_accel : float = ((fall_speed - DRAG_START) / (TERMINAL_VELOCITY - DRAG_START)) * 20.0
 			velocity -= to_center * drag_accel * delta
 
-		# ── Buoyancy: 4 bottom corners of the player capsule ──────────────────
-		# Depth is measured radially from the planet centre so it is correct at
-		# any latitude and naturally follows the sphere — no Y-axis approximation
-		# and no curvature-correction hack needed.
+		# ── Buoyancy: foot corners + body-centre spring ───────────────────────
+		# All depth measurements are radial from the planet centre so the result
+		# is identical at any latitude.  Corners use the planet-relative up vector
+		# rather than body-local axes (lock_rotation=true keeps basis = Identity,
+		# so local -Y is world -Y, which is only correct at the spawn pole).
 		const PLAYER_HW  : float = 0.4
 		const PLAYER_HH  : float = 0.7  # matches capsule half-height
 		var up           : Vector3 = -to_center
@@ -361,27 +362,41 @@ func _handle_movement(delta: float) -> void:
 		var water_r      : float   = PlanetTerrain.PLANET_RADIUS + PlanetTerrain.WATER_LEVEL
 		var total_depth  : float   = 0.0
 		var wet_count    : int     = 0
+		# Build a tangent frame aligned to the planet surface normal (up).
+		var tan_a : Vector3 = (up.cross(Vector3.RIGHT) if abs(up.dot(Vector3.RIGHT)) < 0.9
+				else up.cross(Vector3.FORWARD)).normalized()
+		var tan_b : Vector3 = up.cross(tan_a).normalized()
+		var foot_center  : Vector3 = body_tf.origin - up * PLAYER_HH
 		var foot_corners : Array[Vector3] = [
-			Vector3(-PLAYER_HW, -PLAYER_HH, -PLAYER_HW),
-			Vector3( PLAYER_HW, -PLAYER_HH, -PLAYER_HW),
-			Vector3(-PLAYER_HW, -PLAYER_HH,  PLAYER_HW),
-			Vector3( PLAYER_HW, -PLAYER_HH,  PLAYER_HW),
+			foot_center + (-tan_a - tan_b) * PLAYER_HW,
+			foot_center + ( tan_a - tan_b) * PLAYER_HW,
+			foot_center + (-tan_a + tan_b) * PLAYER_HW,
+			foot_center + ( tan_a + tan_b) * PLAYER_HW,
 		]
-		for lc in foot_corners:
-			var wc    : Vector3 = body_tf * lc
+		for wc in foot_corners:
 			var depth : float   = water_r - wc.distance_to(planet_c)
 			if depth > 0.0:
 				total_depth += depth
 				wet_count   += 1
 		if wet_count > 0:
 			var avg_depth  : float = total_depth / float(wet_count)
-			# Cap effective depth so being far underwater doesn't launch the player
-			# violently past the surface. Equilibrium: buoyancy = gravity at 1 unit depth.
-			var buoy_depth : float = minf(avg_depth, 2.0)
-			velocity += up * (buoy_depth * 20.0) * delta
+			# Uncapped foot-corner buoyancy — equilibrium at avg_depth = 1 m
+			# (buoy force = gravity).  No cap so restoration is proportionally
+			# stronger when deeply submerged, counteracting fast entries.
+			velocity += up * (avg_depth * 20.0) * delta
+
+			# Body-centre spring: extra upward push proportional to how far the
+			# body centre is below water_r.  This prevents gradual sinking when
+			# the player swims through water — foot-corner buoyancy alone only
+			# acts on the bottom of the capsule and can be slow to restore when
+			# the whole body is submerged.
+			# New equilibrium: centre_depth ≈ 0.1 m, spring adds 0.1 * 40 * delta.
+			var centre_depth : float = water_r - body_tf.origin.distance_to(planet_c)
+			if centre_depth > 0.0:
+				velocity += up * (centre_depth * 40.0) * delta
+
 			# Split drag into vertical and horizontal components.
-			# Vertical: overdamped (c≈10 > c_crit≈8.9) to kill oscillation after
-			# high-speed entries — stops the player from bouncing above the sphere.
+			# Vertical: overdamped to kill oscillation after high-speed entries.
 			# Horizontal: light drag so swimming stays responsive.
 			var vert  : float  = velocity.dot(up)
 			var horiz : Vector3 = velocity - up * vert

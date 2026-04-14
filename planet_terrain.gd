@@ -1006,21 +1006,22 @@ static func water_surface_y(wx: float, wz: float) -> float:
 
 func _create_water_sphere() -> void:
 	var radius : float = PLANET_RADIUS + WATER_LEVEL
-	var sphere := SphereMesh.new()
-	sphere.radius          = radius
-	sphere.height          = radius * 2.0
-	sphere.radial_segments = 96
-	sphere.rings           = 64
+	# Use a BoxMesh as a minimal proxy (12 triangles) — the ray-sphere shader computes
+	# the exact mathematical sphere surface per-fragment, so proxy geometry only needs
+	# to cover the right screen pixels.  A cube of side 2×radius fully encloses the
+	# sphere and avoids all tessellation / midpoint-sag issues.
+	var box := BoxMesh.new()
+	box.size = Vector3(radius * 2.0, radius * 2.0, radius * 2.0)
 
 	# Ray-sphere shader: each fragment ray-casts to the exact mathematical sphere so
-	# the visible water surface is pixel-perfect regardless of polygon faceting.
-	# A SphereMesh at radius 50 000 m with 96×64 segments sags up to ~13 m at triangle
-	# midpoints — far more than WATER_LEVEL (-5 m) — which made the player appear to
-	# float above the visible mesh while buoyancy (which uses the exact radius) was correct.
+	# the visible water surface is pixel-perfect regardless of proxy geometry.
 	var shader := Shader.new()
 	shader.code = """
 shader_type spatial;
-render_mode blend_mix, depth_draw_never, cull_disabled;
+// depth_draw_always so the explicit DEPTH write below takes effect even in the
+// transparent pass.  Without this the box-proxy face depth (not the sphere
+// surface depth) would be used for occlusion, letting water bleed over terrain.
+render_mode blend_mix, depth_draw_always, cull_disabled;
 
 uniform vec3  sphere_center;
 uniform float sphere_radius;
@@ -1058,6 +1059,13 @@ void fragment() {
     vec3 hit = cam + t * d;
     vec3 N   = normalize(hit - sphere_center);
 
+    // Write the sphere-surface depth so terrain closer than the water surface
+    // correctly occludes it via the depth test.  Without this, the proxy box
+    // face depth is used, which differs from the sphere surface and causes
+    // water to render over land (or land to show through shallow water).
+    vec4 clip_hit = PROJECTION_MATRIX * (VIEW_MATRIX * vec4(hit, 1.0));
+    DEPTH = clip_hit.z / clip_hit.w;
+
     ALBEDO    = vec3(0.06, 0.22, 0.52);
     ALPHA     = 0.70;
     NORMAL    = normalize(mat3(VIEW_MATRIX) * N);
@@ -1073,7 +1081,7 @@ void fragment() {
 
 	var mi := MeshInstance3D.new()
 	mi.name              = "WaterSphere"
-	mi.mesh              = sphere
+	mi.mesh              = box
 	mi.material_override = mat
 	mi.position          = Vector3(0.0, -PLANET_RADIUS, 0.0)
 	mi.cast_shadow       = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF

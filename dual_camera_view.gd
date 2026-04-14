@@ -650,13 +650,15 @@ func _update_vehicle_camera() -> void:
 func _update_world_camera() -> void:
 	var world_pos = character.get_world_position()
 
-	# Use world up in world space, but transition smoothly during reorientation
-	var effective_up = Vector3.UP
+	# Planet-radial up so the horizon stays level at all latitudes.
+	# (World +Y is only correct at the spawn pole — off-pole it tilts the horizon and
+	# drifts the camera closer to the sphere surface than intended.)
+	var planet_c_wc  := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+	var local_up     := (world_pos - planet_c_wc).normalized()
 
-	# During reorientation, use the character's current visual basis for camera orientation
-	# This ensures smooth transition from interior orientation to world UP
+	# During reorientation smoothly transition from the interior's up toward planet up.
+	var effective_up = local_up
 	if character.is_reorienting:
-		# Use character's transitioning visual basis as the effective up
 		effective_up = character.current_visual_basis.y
 
 	# Get look direction from base_rotation
@@ -664,16 +666,17 @@ func _update_world_camera() -> void:
 	var forward = -rotation_basis.z
 
 	if third_person_mode:
-		# Third person camera - position behind and above character
-		var offset = -forward * third_person_distance + Vector3(0, 3, 0)
+		# Third person camera - position behind and above character (radially up)
+		var offset = -forward * third_person_distance + local_up * 3.0
 		main_camera.global_position = world_pos + offset
-		# Use effective_up for instant orientation or smooth transition
 		var camera_basis = _get_camera_basis_from_look_and_up(forward, effective_up)
 		main_camera.global_transform.basis = camera_basis
 	else:
-		# First person camera - at character position
-		main_camera.global_position = world_pos
-		# Use effective_up for smooth transition during reorientation
+		# First person camera - at head level (capsule half-height above body centre,
+		# in the planet-radial direction).  This keeps the camera consistently above the
+		# water surface at any latitude when floating at buoyancy equilibrium.
+		const HEAD_HEIGHT := 0.7   # matches CapsuleShape3D half-height
+		main_camera.global_position = world_pos + local_up * HEAD_HEIGHT
 		var camera_basis = _get_camera_basis_from_look_and_up(forward, effective_up)
 		main_camera.global_transform.basis = camera_basis
 
@@ -808,9 +811,15 @@ func get_forward_direction() -> Vector3:
 		forward.y = 0
 		return forward.normalized()
 	else:
-		var forward = -main_camera.global_transform.basis.z
-		forward.y = 0
-		return forward.normalized()
+		# Project onto the planet tangent plane so movement stays on-surface at any latitude.
+		# Zeroing world Y only works at the spawn pole; off-pole it adds a radial component.
+		var forward  = -main_camera.global_transform.basis.z
+		var planet_c := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+		var up       := (character.get_world_position() - planet_c).normalized()
+		forward       = forward - up * forward.dot(up)
+		if forward.length_squared() > 1e-4:
+			return forward.normalized()
+		return -main_camera.global_transform.basis.z.normalized()
 
 func get_right_direction() -> Vector3:
 	if not is_instance_valid(character):
@@ -823,9 +832,14 @@ func get_right_direction() -> Vector3:
 		right.y = 0
 		return right.normalized()
 	else:
-		var right = main_camera.global_transform.basis.x
-		right.y = 0
-		return right.normalized()
+		# Project onto the planet tangent plane (same reason as get_forward_direction).
+		var right    = main_camera.global_transform.basis.x
+		var planet_c := Vector3(0.0, -PlanetTerrain.PLANET_RADIUS, 0.0)
+		var up       := (character.get_world_position() - planet_c).normalized()
+		right         = right - up * right.dot(up)
+		if right.length_squared() > 1e-4:
+			return right.normalized()
+		return main_camera.global_transform.basis.x.normalized()
 
 func _update_proxy_character_visuals() -> void:
 	# Update character visual in proxy interior viewports
